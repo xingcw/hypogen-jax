@@ -37,6 +37,7 @@ class HyPoGenConfig:
     dl_din_way: str = "slice"
     dl_dw_way: str = "direct"
     init_lr: float = -1e-2
+    per_task_apply: bool = False
 
     def head_layers(self, head: int) -> List[tuple]:
         # (name, in_dim, out_dim) of the target net layers of a head
@@ -199,6 +200,33 @@ def apply_target(cfg: HyPoGenConfig, head: int, w, x):
     return jnp.tanh(h) if head == 1 else h
 
 
+def apply_target_per_task(cfg: HyPoGenConfig, head: int, w, x, inv):
+    """Task-major target MLP: w entries are (U, ...) and x is (B, in).
+
+    Same maths as gathering the weights per sample, but matmuls instead of
+    batched matrix-vector products, at a factor U more FLOPs.
+    """
+    names = [name for name, _, _ in cfg.head_layers(head)]
+    h = None
+    for i, name in enumerate(names):
+        weight, bias = w[f"{name}.weight"], w[f"{name}.bias"]
+        h = (
+            jnp.einsum("bi,uoi->ubo", x, weight)
+            if h is None
+            else jnp.einsum("ubi,uoi->ubo", h, weight)
+        ) + bias[:, None, :]
+        if i < len(names) - 1:
+            h = jax.nn.relu(h)
+    h = jnp.tanh(h) if head == 1 else h
+    return h[inv, jnp.arange(h.shape[1])]
+
+
+def _apply(cfg: HyPoGenConfig, head: int, w, x, inv):
+    if cfg.per_task_apply:
+        return apply_target_per_task(cfg, head, w, x, inv)
+    return apply_target(cfg, head, gather(w, inv), x)
+
+
 def unique_tasks(input_param, max_unique):
     uniq, inv = jnp.unique(
         input_param, axis=0, size=max_unique, fill_value=0.0, return_inverse=True
@@ -210,24 +238,30 @@ def gather(w, inv):
     return {k: v[inv] for k, v in w.items()}
 
 
-def model_losses(p, cfg: HyPoGenConfig, batch, max_unique, value_weight, td_weight, z_override=None):
-    """Training loss of approximators.rl_solution.RLApproximator.update."""
+def model_losses(
+    p, cfg: HyPoGenConfig, batch, max_unique, value_weight, td_weight,
+    z_override=None, task=None,
+):
+    """Training loss of approximators.rl_solution.RLApproximator.update.
+
+    task is an optional precomputed (uniq, inv), avoiding a per-step sort.
+    """
     input_param, state, action, next_state, reward, discount, value = batch
-    uniq, inv = unique_tasks(input_param, max_unique)
+    uniq, inv = unique_tasks(input_param, max_unique) if task is None else task
     z_u = task_embedding(p, uniq) if z_override is None else z_override
     pol_w = forward_weights(p, cfg, 1, z_u)
     q_w = forward_weights(p, cfg, 2, z_u)
 
     sa = jnp.concatenate([state, action], -1)
-    pred_action = jnp.stack([apply_target(cfg, 1, gather(w, inv), state) for w in pol_w])
-    pred_q = jnp.stack([apply_target(cfg, 2, gather(w, inv), sa) for w in q_w])
+    pred_action = jnp.stack([_apply(cfg, 1, w, state, inv) for w in pol_w])
+    pred_q = jnp.stack([_apply(cfg, 2, w, sa, inv) for w in q_w])
 
     loss_action = jnp.mean((pred_action - action[None]) ** 2)
     loss_value = jnp.mean((pred_q - value[None]) ** 2)
 
-    next_action = jax.lax.stop_gradient(apply_target(cfg, 1, gather(pol_w[-1], inv), next_state))
+    next_action = jax.lax.stop_gradient(_apply(cfg, 1, pol_w[-1], next_state, inv))
     nsa = jnp.concatenate([next_state, next_action], -1)
-    target_q = reward + discount * apply_target(cfg, 2, gather(q_w[-1], inv), nsa)
+    target_q = reward + discount * _apply(cfg, 2, q_w[-1], nsa, inv)
     loss_td = jnp.mean((value - target_q) ** 2)
 
     loss = loss_action + value_weight * loss_value + td_weight * loss_td
@@ -254,7 +288,7 @@ def predict_action(p, cfg: HyPoGenConfig, input_param, state, max_unique):
     uniq, inv = unique_tasks(input_param, max_unique)
     z_u = task_embedding(p, uniq)
     w = forward_weights(p, cfg, 1, z_u)[-1]
-    return apply_target(cfg, 1, gather(w, inv), state)
+    return _apply(cfg, 1, w, state, inv)
 
 
 def _uniform(key, shape, bound):

@@ -22,8 +22,6 @@ import optax
 from data import load_dataset
 from model import HyPoGenConfig, count_params, init_params, model_losses, save_npz
 
-jax.config.update("jax_default_matmul_precision", "highest")
-
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -52,6 +50,19 @@ def parse_args():
     ap.add_argument("--num_layers", type=int, default=8)
     ap.add_argument("--dl_din_way", default="slice")
     ap.add_argument("--dl_dw_way", default="direct")
+    ap.add_argument(
+        "--matmul_precision", default="high", choices=["default", "high", "highest"],
+        help="float32 matmul mode; on TPU highest/high/default are 6/3/1 "
+             "bfloat16 passes",
+    )
+    ap.add_argument(
+        "--per_task_apply", action="store_true",
+        help="task-major target nets instead of per-sample weight gathers",
+    )
+    ap.add_argument(
+        "--drop_last", action="store_true",
+        help="skip the partial last batch, so XLA compiles one program not two",
+    )
     return ap.parse_args()
 
 
@@ -62,6 +73,9 @@ def lr_at_epoch(args, epoch):
 
 def main():
     args = parse_args()
+    jax.config.update("jax_default_matmul_precision", args.matmul_precision)
+    print(f"backend {jax.default_backend()} devices {jax.devices()} "
+          f"matmul_precision {args.matmul_precision}")
     out_dir = Path(args.out_dir)
     ckpt_dir = out_dir / "ckpt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -75,7 +89,10 @@ def main():
     print("train params", train_params)
     print("test params", test_params)
     n_train = train[0].shape[0]
-    max_unique = int(np.unique(train[0], axis=0).shape[0])
+    # task column is fixed, so map rows to tasks once instead of per step
+    uniq_np, inv_np = np.unique(train[0], axis=0, return_inverse=True)
+    inv_np = np.asarray(inv_np).reshape(-1).astype(np.int32)
+    max_unique = int(uniq_np.shape[0])
     print(f"train rows {n_train}, unique tasks {max_unique}")
 
     cfg = HyPoGenConfig(
@@ -92,6 +109,7 @@ def main():
         num_layers=args.num_layers,
         dl_din_way=args.dl_din_way,
         dl_dw_way=args.dl_dw_way,
+        per_task_apply=args.per_task_apply,
     )
     init_seed = args.seed if args.init_seed is None else args.init_seed
     params = init_params(jax.random.PRNGKey(init_seed), cfg)
@@ -100,21 +118,34 @@ def main():
     opt = optax.inject_hyperparams(optax.adam)(learning_rate=args.lr)
     opt_state = opt.init(params)
     train_dev = [jnp.asarray(t) for t in train]
+    inv_dev = jnp.asarray(inv_np)
+    uniq_dev = jnp.asarray(uniq_np)
 
-    def loss_fn(p, batch):
-        loss, (aux, _) = model_losses(p, cfg, batch, max_unique, args.value_weight, args.td_weight)
+    def loss_fn(p, batch, inv):
+        loss, (aux, _) = model_losses(
+            p, cfg, batch, max_unique, args.value_weight, args.td_weight,
+            task=(uniq_dev, inv),
+        )
         return loss, aux
 
-    @jax.jit
-    def train_step(p, s, batch):
-        (_, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, batch)
+    def step_body(carry, idx):
+        p, s = carry
+        batch = [t[idx] for t in train_dev]
+        (_, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(p, batch, inv_dev[idx])
         updates, s = opt.update(grads, s, p)
         p = optax.apply_updates(p, updates)
-        return p, s, aux
+        return (p, s), aux
 
     @jax.jit
-    def take(idx):
-        return [t[idx] for t in train_dev]
+    def run_epoch(p, s, idx_batches):
+        """One epoch of same-shape steps, with no host round trip per step."""
+        (p, s), auxes = jax.lax.scan(step_body, (p, s), idx_batches)
+        return p, s, jax.tree.map(lambda v: v.sum(0), auxes)
+
+    @jax.jit
+    def tail_step(p, s, idx):
+        (p, s), aux = step_body((p, s), idx)
+        return p, s, aux
 
     csv_path = out_dir / "train_valid.csv"
     fields = ["epoch", "lr", "loss_total", "loss_action_pred", "loss_value_pred", "loss_td", "epoch_time"]
@@ -124,18 +155,23 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     bs = args.batch_size
+    n_full = n_train // bs
     for epoch in range(args.num_train_epochs):
         t0 = time.time()
         lr = lr_at_epoch(args, epoch)
         opt_state.hyperparams["learning_rate"] = lr
+        # same RNG stream and batches as before, uploaded in one go
         perm = rng.permutation(n_train)
-        sums = {}
-        n_batches = 0
-        for i in range(0, n_train, bs):
-            idx = jnp.asarray(perm[i:i + bs])
-            params, opt_state, aux = train_step(params, opt_state, take(idx))
-            for k, v in aux.items():
-                sums[k] = sums.get(k, 0.0) + v
+        sums, n_batches = None, 0
+        if n_full:
+            params, opt_state, sums = run_epoch(
+                params, opt_state, jnp.asarray(perm[:n_full * bs].reshape(n_full, bs))
+            )
+            n_batches = n_full
+        tail = perm[n_full * bs:]
+        if tail.size and not args.drop_last:
+            params, opt_state, aux = tail_step(params, opt_state, jnp.asarray(tail))
+            sums = aux if sums is None else {k: sums[k] + aux[k] for k in sums}
             n_batches += 1
         row = {k: float(v) / n_batches for k, v in sums.items()}
         if not np.isfinite(row["loss_total"]):

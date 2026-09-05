@@ -18,12 +18,15 @@ sys.path.append('./')
 
 import os
 import platform
+import ctypes.util
 import logging
 import math
 
 if platform.system() == "Linux":
     os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
-    os.environ["MUJOCO_GL"] = "egl"
+    os.environ["MUJOCO_GL"] = os.environ.get(
+        "MUJOCO_GL", "egl" if ctypes.util.find_library("EGL") else "osmesa"
+    )
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from pathlib import Path

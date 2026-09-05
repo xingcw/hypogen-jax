@@ -9,11 +9,14 @@ warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import os
 import platform
+import ctypes.util
 import logging
 
 if platform.system() == 'Linux':
     os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-    os.environ['MUJOCO_GL'] = 'egl'
+    os.environ['MUJOCO_GL'] = os.environ.get(
+        'MUJOCO_GL', 'egl' if ctypes.util.find_library('EGL') else 'osmesa'
+    )
 
 from pathlib import Path
 

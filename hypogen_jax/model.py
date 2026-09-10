@@ -27,6 +27,12 @@ class HyPoGenConfig:
     action_dim: int
     embed_dim: int = 256
     hidden_dim: int = 256
+    # widths of the policy head's hidden layers; empty means [hidden_dim],
+    # i.e. the upstream single-hidden-layer net
+    hidden_dims: tuple = ()
+    # same for the critic head; empty falls back to hidden_dims, so one knob
+    # covers both heads unless they are deliberately split
+    critic_hidden_dims: tuple = ()
     weight_dim: int = 128
     enc_dec_dim: int = 256
     num_enc_dec_layer: int = 2
@@ -43,7 +49,12 @@ class HyPoGenConfig:
         # (name, in_dim, out_dim) of the target net layers of a head
         in_dim = self.state_dim if head == 1 else self.state_dim + self.action_dim
         out_dim = self.action_dim if head == 1 else 1
-        return [("fc0", in_dim, self.hidden_dim), ("fc1", self.hidden_dim, out_dim)]
+        dims = self.hidden_dims if head == 1 else (self.critic_hidden_dims
+                                                   or self.hidden_dims)
+        widths = [int(w) for w in dims] or [self.hidden_dim]
+        dims = [in_dim] + widths
+        return ([(f"fc{i}", dims[i], dims[i + 1]) for i in range(len(widths))]
+                + [(f"fc{len(widths)}", widths[-1], out_dim)])
 
     def pseudo_dims(self, head: int):
         layers = self.head_layers(head)

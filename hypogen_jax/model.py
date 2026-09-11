@@ -42,6 +42,8 @@ class HyPoGenConfig:
     pseudo_dim: int = 64
     dl_din_way: str = "slice"
     dl_dw_way: str = "direct"
+    # hidden nonlinearity of the policy head; the critic head stays relu
+    policy_act: str = "relu"
     init_lr: float = -1e-2
     per_task_apply: bool = False
 
@@ -200,14 +202,29 @@ def forward_weights(p, cfg: HyPoGenConfig, head: int, ftask) -> List[Dict[str, j
     return finals
 
 
+_ACTS = {"relu": jax.nn.relu, "tanh": jnp.tanh}
+
+
+def head_act(cfg: HyPoGenConfig, head: int):
+    """Hidden nonlinearity of a head's target net."""
+    if head != 1:
+        return jax.nn.relu
+    try:
+        return _ACTS[cfg.policy_act]
+    except KeyError:
+        raise ValueError(f"policy_act={cfg.policy_act!r} is not "
+                         f"{sorted(_ACTS)}") from None
+
+
 def apply_target(cfg: HyPoGenConfig, head: int, w, x):
     """Per-sample target MLP: w entries are (B, ...) and x is (B, in)."""
     names = [name for name, _, _ in cfg.head_layers(head)]
+    act = head_act(cfg, head)
     h = x
     for i, name in enumerate(names):
         h = jnp.einsum("bi,boi->bo", h, w[f"{name}.weight"]) + w[f"{name}.bias"]
         if i < len(names) - 1:
-            h = jax.nn.relu(h)
+            h = act(h)
     return jnp.tanh(h) if head == 1 else h
 
 
@@ -218,6 +235,7 @@ def apply_target_per_task(cfg: HyPoGenConfig, head: int, w, x, inv):
     batched matrix-vector products, at a factor U more FLOPs.
     """
     names = [name for name, _, _ in cfg.head_layers(head)]
+    act = head_act(cfg, head)
     h = None
     for i, name in enumerate(names):
         weight, bias = w[f"{name}.weight"], w[f"{name}.bias"]
@@ -227,7 +245,7 @@ def apply_target_per_task(cfg: HyPoGenConfig, head: int, w, x, inv):
             else jnp.einsum("ubi,uoi->ubo", h, weight)
         ) + bias[:, None, :]
         if i < len(names) - 1:
-            h = jax.nn.relu(h)
+            h = act(h)
     h = jnp.tanh(h) if head == 1 else h
     return h[inv, jnp.arange(h.shape[1])]
 
